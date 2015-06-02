@@ -50,7 +50,7 @@ setup(name="AutoPush",
           "datadog==0.5.0",
           "eliot==0.7.1",
           "repoze.lru==0.6",
-          "manhole=1.0.0",
+          "manhole==1.0.0",
       ],
       entry_points="""
       [console_scripts]
