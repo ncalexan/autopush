@@ -2,6 +2,14 @@
 Autopush Changelog
 ==================
 
+1.2.3 (**dev**)
+===============
+
+Features
+--------
+
+* Add debugging entry point for live interaction with autopush server.
+
 1.2.2 (May 27, 2015)
 ====================
 
