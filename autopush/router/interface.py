@@ -1,5 +1,11 @@
 """Router interface"""
+from collections import namedtuple
 from autopush.exceptions import AutopushException
+
+
+class Notification(namedtuple("Notification",
+                   "version data channel_id headers ttl")):
+    """Parsed notification from the request"""
 
 
 class RouterException(AutopushException):

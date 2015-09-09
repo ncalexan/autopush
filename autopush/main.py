@@ -9,6 +9,7 @@ from twisted.web.server import Site
 from autopush.endpoint import (
     EndpointHandler,
     MessageHandler,
+    ReceiptSubscribeHandler,
     RegistrationHandler,
 )
 from autopush.health import (HealthHandler, StatusHandler)
@@ -373,6 +374,8 @@ def endpoint_main(sysargs=None):
     site = cyclone.web.Application([
         (r"/push/([^\/]+)", EndpointHandler, dict(ap_settings=settings)),
         (r"/m/([^\/]+)", MessageHandler, dict(ap_settings=settings)),
+        (r"/receipts/([^\/]+)", ReceiptSubscribeHandler,
+         dict(ap_settings=settings)),
         # PUT /register/ => connect info
         # GET /register/uaid => chid + endpoint
         (r"/register(?:/(.+))?", RegistrationHandler,

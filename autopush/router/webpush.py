@@ -9,11 +9,20 @@ import json
 import time
 from StringIO import StringIO
 
+from twisted.internet.defer import (
+    inlineCallbacks,
+    returnValue,
+)
 from twisted.internet.threads import deferToThread
 from twisted.web.client import FileBodyProducer
+from cryptography.fernet import InvalidToken
 
 from autopush.protocol import IgnoreBody
-from autopush.router.interface import RouterException, RouterResponse
+from autopush.router.interface import (
+    RouterException,
+    RouterResponse,
+    Notification,
+)
 from autopush.router.simple import SimpleRouter
 
 
@@ -45,11 +54,43 @@ class WebPushRouter(SimpleRouter):
             raise RouterException("No such subscription", status_code=404,
                                   log_exception=False)
 
-    def preflight_check(self, uaid, channel_id):
+    @inlineCallbacks
+    def preflight_check(self, uaid, notification):
         """Verifies this routing call can be done successfully"""
-        d = deferToThread(self.ap_settings.message.all_channels, uaid=uaid)
-        d.addCallback(self._verify_channel, channel_id)
-        return d
+        receipt = notification.headers.get("push-receipt", "").strip()
+        if receipt:
+            try:
+                receipt_uaid, chid, receipt_id = yield deferToThread(
+                    self.ap_settings.parse_push_receipt, receipt)
+            except (InvalidToken, ValueError):
+                # The token or endpoint URL is invalid.
+                raise self.invalid_endpoint_response()
+
+            if receipt_uaid != uaid or chid != notification.channel_id:
+                # The endpoint is valid, but belongs to a different device or
+                # channel ID. Pretend we've never heard of it.
+                raise self.invalid_endpoint_response()
+
+            # Valid receipt endpoint. Append the receipt ID to the version;
+            # this will be used to route the receipt to the correct receipt
+            # node once the client acks the message.
+            notification = Notification(
+                version="%s:%s" % (notification.version, receipt_id),
+                data=notification.data,
+                channel_id=notification.channel_id,
+                headers=notification.headers,
+                ttl=notification.ttl,
+            )
+
+        result = yield deferToThread(self.ap_settings.message.all_channels,
+                                     uaid=uaid)
+        if notification.channel_id not in result:
+            raise RouterException("No such subscription", status_code=404)
+
+        returnValue(notification)
+
+    def invalid_endpoint_response(self):
+        return RouterException("Invalid receipt endpoint", status_code=400)
 
     def _send_notification(self, uaid, node_id, notification):
         """Send a notification to a specific node_id

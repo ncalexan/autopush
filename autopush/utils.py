@@ -19,9 +19,22 @@ def str2bool(v):
     return v in ("1", "t", "T", "true", "TRUE", "True")
 
 
+def is_default_port(scheme, port=None):
+    return port is None or port == default_ports.get(scheme)
+
+
+def is_same_origin(a, b):
+    """Determines whether two URLs have the same origin."""
+    return a.scheme == b.scheme and a.hostname == b.hostname and (
+        a.port == b.port or
+        a.port is None and is_default_port(b.scheme, b.port) or
+        b.port is None and is_default_port(a.scheme, a.port)
+    )
+
+
 def canonical_url(scheme, hostname, port=None):
     """Return a canonical URL given a scheme/hostname and optional port"""
-    if port is None or port == default_ports.get(scheme):
+    if is_default_port(scheme, port):
         return "%s://%s" % (scheme, hostname)
     return "%s://%s:%s" % (scheme, hostname, port)
 

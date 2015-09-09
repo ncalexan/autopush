@@ -34,6 +34,7 @@ import time
 import uuid
 from collections import defaultdict, namedtuple
 from functools import wraps
+from StringIO import StringIO
 
 import cyclone.web
 from autobahn.twisted.websocket import WebSocketServerProtocol
@@ -41,7 +42,8 @@ from twisted.internet import reactor
 from twisted.internet.defer import (
     Deferred,
     DeferredList,
-    CancelledError
+    CancelledError,
+    maybeDeferred,
 )
 from twisted.internet.error import (
     ConnectError, ConnectionRefusedError, UserError
@@ -51,11 +53,17 @@ from twisted.internet.threads import deferToThread
 from twisted.python import failure, log
 from zope.interface import implements
 from twisted.web.resource import Resource
+from twisted.web.client import FileBodyProducer
+from repoze.lru import LRUCache
 
 from autopush import __version__
 from autopush.protocol import IgnoreBody
+from autopush.router.simple import node_key
 from autopush.utils import validate_uaid
 from autopush.noseplugin import track_object
+
+
+dead_receipt_nodes = LRUCache(150)
 
 
 def ms_time():
@@ -677,7 +685,7 @@ class SimplePushServerProtocol(WebSocketServerProtocol):
         now = int(time.time())
         for notif in notifs:
             # Split off the chid and message id
-            chid, version = notif["chidmessageid"].split(":")
+            chid, version = notif["chidmessageid"].split(":", 1)
 
             # If the TTL is too old, don't deliver and fire a delete off
             if now >= notif["ttl"]:
@@ -738,8 +746,8 @@ class SimplePushServerProtocol(WebSocketServerProtocol):
             return self.bad_message("register")
         self.transport.pauseProducing()
 
-        d = self.deferToThread(self.ap_settings.make_endpoint, self.ps.uaid,
-                               chid)
+        d = self.deferToThread(self.ap_settings.fernet.encrypt,
+                               (self.ps.uaid + ':' + chid).encode('utf8'))
         d.addCallback(self.finish_register, chid)
         d.addErrback(self.error_register)
         return d
@@ -750,23 +758,26 @@ class SimplePushServerProtocol(WebSocketServerProtocol):
         msg = {"messageType": "register", "status": 500}
         self.sendJSON(msg)
 
-    def finish_register(self, endpoint, chid):
+    def finish_register(self, token, chid):
         """callback for successful endpoint creation, sends register reply"""
         if self.ps.use_webpush:
             d = self.deferToThread(self.ap_settings.message.register_channel,
                                    self.ps.uaid, chid)
-            d.addCallback(self.send_register_finish, endpoint, chid)
+            d.addCallback(self.send_register_finish, token, chid)
             return d
         else:
-            self.send_register_finish(None, endpoint, chid)
+            self.send_register_finish(None, token, chid)
 
-    def send_register_finish(self, result, endpoint, chid):
+    def send_register_finish(self, result, token, chid):
         self.transport.resumeProducing()
+        endpoint_params = (self.ap_settings.endpoint_url, token)
         msg = {"messageType": "register",
                "channelID": chid,
-               "pushEndpoint": endpoint,
+               "pushEndpoint": "%s/push/%s" % endpoint_params,
                "status": 200
                }
+        if self.ps.use_webpush:
+            msg["receiptEndpoint"] = "%s/receipts/%s" % endpoint_params
         self.sendJSON(msg)
         self.ps.metrics.increment("updates.client.register",
                                   tags=self.base_tags)
@@ -799,6 +810,13 @@ class SimplePushServerProtocol(WebSocketServerProtocol):
             self.force_retry(
                 self.ap_settings.message.delete_messages_for_channel,
                 self.ps.uaid, chid)
+
+            # Close all receipt streams for this channel.
+            d = self.force_retry(
+                self.ap_settings.receipts.delete_nodes_for_channel,
+                self.ps.uaid, chid)
+            d.addCallback(lambda nodes: DeferredList(filter(None,
+                          map(self._close_webpush_receipt, nodes))))
         else:
             # Delete any record from storage, we don't wait for this
             self.force_retry(self.ap_settings.storage.delete_notification,
@@ -806,6 +824,31 @@ class SimplePushServerProtocol(WebSocketServerProtocol):
 
         data["status"] = 200
         self.sendJSON(data)
+
+    def _close_webpush_receipt(self, node):
+        node_id, receipt_id = node
+        if not node_id:
+            return
+
+        key = node_key(node_id)
+        if dead_receipt_nodes.get(key):
+            return
+
+        url = node_id + "/receipt/" + receipt_id
+        d = self.ap_settings.agent.request(
+            "DELETE",
+            url.encode("utf8"),
+        ).addCallback(IgnoreBody.ignore)
+        d.addErrback(self._handle_webpush_dead_receipt_node, key)
+        d.addErrback(self.log_err,
+                     extra="Failed to close receipt stream for channel")
+
+    def _handle_webpush_dead_receipt_node(self, fail, key, result=None):
+        fail.trap(ConnectError, ConnectionRefusedError, UserError)
+        dead_receipt_nodes.put(key, True)
+        if result:
+            return deferToThread(self.ap_settings.receipts.clear_node,
+                                 result)
 
     def ack_update(self, update):
         """Helper function for tracking ack'd updates
@@ -833,7 +876,7 @@ class SimplePushServerProtocol(WebSocketServerProtocol):
         found = filter(ver_filter, self.ps.direct_updates[chid])
         if found:
             self.ps.direct_updates[chid].remove(found[0])
-            return
+            return maybeDeferred(self._lookup_receipt, None, found[0])
 
         found = filter(ver_filter, self.ps.updates_sent[chid])
         if found:
@@ -843,7 +886,9 @@ class SimplePushServerProtocol(WebSocketServerProtocol):
             # This is because we don't use range queries on dynamodb and we
             # need to make sure this notification is deleted from the db before
             # we query it again (to avoid dupes).
+            d.addCallback(self._lookup_receipt, found[0])
             d.addBoth(self._handle_webpush_update_remove, chid, found[0])
+            return d
 
     def _handle_webpush_update_remove(self, result, chid, notif):
         """Handle clearing out the updates_sent
@@ -856,6 +901,40 @@ class SimplePushServerProtocol(WebSocketServerProtocol):
             self.ps.updates_sent[chid].remove(notif)
         except AttributeError:
             pass
+
+    def _lookup_receipt(self, result, notif):
+        if ":" not in notif.version:
+            # Didn't request receipts.
+            return
+
+        version, receipt_id = notif.version.split(":", 1)
+
+        d = deferToThread(self.ap_settings.receipts.get_node, self.ps.uaid,
+                          notif.channel_id, receipt_id)
+        d.addCallback(self._send_webpush_receipt, version, receipt_id)
+        # # TODO: Store acks if we want reliable receipts.
+        d.addErrback(self.log_err, extra="Error delivering receipt")
+        return d
+
+    def _send_webpush_receipt(self, result, version, receipt_id):
+        node_id = result.get("node_id")
+        if not node_id:
+            return
+
+        key = node_key(node_id)
+        if dead_receipt_nodes.get(key):
+            return
+
+        payload = json.dumps({"path": "/m/%s" % version})
+        url = node_id + "/receipt/" + receipt_id
+
+        d = self.ap_settings.agent.request(
+            "PUT",
+            url.encode("utf8"),
+            bodyProducer=FileBodyProducer(StringIO(payload)),
+        ).addCallback(IgnoreBody.ignore)
+        d.addErrback(self._handle_webpush_dead_receipt_node, key, result)
+        return d
 
     def _handle_simple_ack(self, chid, version):
         """Handle clearing out a simple ack"""
@@ -890,6 +969,9 @@ class SimplePushServerProtocol(WebSocketServerProtocol):
 
     def check_missed_notifications(self, results, resume=False):
         """Check to see if notifications were missed"""
+        if self.ps._should_stop:
+            return
+
         if resume:
             # Resume consuming ack's
             self.transport.resumeProducing()

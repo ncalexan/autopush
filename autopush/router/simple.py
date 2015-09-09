@@ -53,9 +53,9 @@ class SimpleRouter(object):
         """Return no additional routing data"""
         return {}
 
-    def preflight_check(self, uaid, channel_id):
+    def preflight_check(self, uaid, notification):
         """Verifies this routing call can be done successfully"""
-        return True
+        return notification
 
     def stored_response(self, notification):
         return RouterResponse(202, "Notification Stored")
@@ -73,7 +73,7 @@ class SimpleRouter(object):
         router = self.ap_settings.router
 
         # Preflight check, hook used by webpush to verify channel id
-        yield self.preflight_check(uaid, notification.channel_id)
+        notification = yield self.preflight_check(uaid, notification)
 
         # Node_id is present, attempt delivery.
         # - Send Notification to node

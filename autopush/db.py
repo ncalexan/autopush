@@ -30,6 +30,16 @@ def create_router_table(tablename="router", read_throughput=5,
                         )
 
 
+def create_receipts_table(tablename="receipts", read_throughput=5,
+                          write_throughput=5):
+    """Create a new receipt node table"""
+    return Table.create(tablename,
+                        schema=[HashKey("uaidchid"), RangeKey("receiptid")],
+                        throughput=dict(read=read_throughput,
+                                        write=write_throughput),
+                        )
+
+
 def create_storage_table(tablename="storage", read_throughput=5,
                          write_throughput=5):
     """Create a new storage table for simplepush style notification storage"""
@@ -70,6 +80,12 @@ def get_router_table(tablename="router", read_throughput=5,
 
     """
     return _make_table(create_router_table, tablename, read_throughput,
+                       write_throughput)
+
+
+def get_receipts_table(tablename="receipts", read_throughput=5,
+                       write_throughput=5):
+    return _make_table(create_receipts_table, tablename, read_throughput,
                        write_throughput)
 
 
@@ -135,6 +151,91 @@ def track_provisioned(func):
             self.metrics.increment("error.provisioned.%s" % func.__name__)
             raise
     return wrapper
+
+
+class Receipts(object):
+    def __init__(self, table, metrics):
+        self.table = table
+        self.metrics = metrics
+        self.encode = table._encode_keys
+
+    @track_provisioned
+    def create_node(self, uaid, chid, receipt_id):
+        conn = self.table.connection
+        try:
+            conn.put_item(
+                self.table.table_name,
+                item=self.encode(dict(uaidchid="%s:%s" % (uaid, chid),
+                                      receiptid=receipt_id)),
+                condition_expression="attribute_not_exists(receiptid)",
+            )
+            return True
+        except ConditionalCheckFailedException:
+            return False
+
+    @track_provisioned
+    def get_node(self, uaid, chid, receipt_id):
+        try:
+            return self.table.get_item(consistent=True,
+                                       uaidchid="%s:%s" % (uaid, chid),
+                                       receiptid=receipt_id)
+        except ProvisionedThroughputExceededException:
+            # We unfortunately have to catch this here, as track_provisioned
+            # will not see this, since JSONResponseError is a subclass and
+            # will capture it
+            self.metrics.increment("error.provisioned.get_receipt")
+            raise
+        except JSONResponseError:  # pragma: nocover
+            # We trap JSONResponseError because Moto returns text instead of
+            # JSON when looking up values in empty tables. We re-throw the
+            # correct ItemNotFound exception
+            raise ItemNotFound("Receipt not found")
+
+    @track_provisioned
+    def clear_node(self, item):
+        conn = self.table.connection
+        # Pop out the node_id
+        node_id = item["node_id"]
+        del item["node_id"]
+
+        try:
+            cond = ("(node_id = :node) and ("
+                    "(connected_at = :conn) or "
+                    "attribute_not_exists(connected_at)"
+                    ")")
+            conn.put_item(
+                self.table.table_name,
+                item=item.get_raw_keys(),
+                condition_expression=cond,
+                expression_attribute_values=self.encode({
+                    ":node": node_id,
+                    ":conn": item["connected_at"],
+                }),
+            )
+            return True
+        except ConditionalCheckFailedException:
+            return False
+
+    def delete_nodes(self, uaid, chid, nodes):
+        with self.table.batch_write() as batch:
+            for node_id, receipt_id in nodes:
+                batch.delete_item(
+                    uaidchid="%s:%s" % (uaid, chid),
+                    receiptid=receipt_id,
+                )
+
+    @track_provisioned
+    def delete_nodes_for_channel(self, uaid, chid):
+        results = self.table.query_2(
+            uaidchid__eq="%s:%s" % (uaid, chid),
+            receiptid__gt=" ",
+            consistent=True,
+            attributes=("receiptid", "node_id"),
+        )
+        nodes = [(x["node_id"], x["receiptid"]) for x in results]
+        if nodes:
+            self.delete_nodes(uaid, chid, nodes)
+        return nodes
 
 
 class Storage(object):

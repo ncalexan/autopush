@@ -186,7 +186,6 @@ import json
 import time
 import urlparse
 import uuid
-from collections import namedtuple
 from base64 import urlsafe_b64encode
 
 import cyclone.web
@@ -199,16 +198,11 @@ from twisted.internet.defer import Deferred
 from twisted.internet.threads import deferToThread
 from twisted.python import failure, log
 
-from autopush.router.interface import RouterException
+from autopush.router.interface import RouterException, Notification
 from autopush.utils import (
     generate_hash,
     validate_hash,
 )
-
-
-class Notification(namedtuple("Notification",
-                   "version data channel_id headers ttl")):
-    """Parsed notification from the request"""
 
 
 def parse_request_params(request):
@@ -728,3 +722,43 @@ class RegistrationHandler(AutoendpointHandler):
             return json.loads(self.request.body)
         except ValueError:
             return {}
+
+
+class ReceiptSubscribeHandler(AutoendpointHandler):
+    cors_methods = "POST"
+    cors_response_headers = ["location"]
+
+    @cyclone.web.asynchronous
+    def post(self, token):
+        fernet = self.ap_settings.fernet
+
+        d = deferToThread(fernet.decrypt, token.encode('utf8'))
+        d.addCallback(self._token_valid)
+        d.addErrback(self._token_err)
+        d.addErrback(self._response_err)
+        return d
+
+    def _token_valid(self, result):
+        info = result.split(":")
+        if len(info) != 2:
+            raise ValueError("Wrong subscription token components")
+
+        self.uaid, self.chid = info
+        self.receipt_id = uuid.uuid4().hex
+
+        d = deferToThread(self.ap_settings.receipts.create_node, self.uaid,
+                          self.chid, self.receipt_id)
+        d.addCallback(self._make_receipt_endpoint)
+        d.addCallback(self._return_receipt)
+        self._db_error_handling(d)
+        d.addErrback(self._response_err)
+        return d
+
+    def _return_receipt(self, result=None):
+        self.set_status(201)
+        self.set_header("Location", result)
+        self.finish()
+
+    def _make_receipt_endpoint(self, result=None):
+        return deferToThread(self.ap_settings.make_receipt_endpoint,
+                             self.uaid, self.chid, self.receipt_id)
